@@ -2,91 +2,140 @@ from langgraph.graph import add_messages, StateGraph, END
 from langgraph.checkpoint.redis import RedisCheckpointSaver
 from langgraph.types import Annotated, TypedDict
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessageChunk, ToolMessage
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.messages import HumanMessage
+from langchain.schema import Document
 from dotenv import load_dotenv
 from typing import Optional, List
-import os
-import ast
+from config import settings
 
-load_dotenv()
+from utils import vectorstore
+
+checkpointer = RedisCheckpointSaver.from_url(settings.redis_url)
 
 
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-checkpointer = RedisCheckpointSaver.from_url(redis_url)
+llm = ChatOpenAI(model="gpt-4o")
 
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]
+    name : str
+    interview_type: str
+    answers: List[str]
+    question_count: int
+    max_questions: int
+    user_id: str
+    session_id: str
+    score: Optional[int]
+    previous_session: Optional[Document]
 
-
-search_tool = TavilySearchResults(max_results=4)
-tools = [search_tool]
-
-
-llm = ChatOpenAI(model="gpt-4o")
-llm_with_tools = llm.bind_tools(tools=tools)
-
+async def start_interview(state: State):
+    intro = f"You are an expert interviewer,Start with introducing youself to {state['name']} and ask the first question on {state['interview_type']}."
+    return {"messages": [HumanMessage(content=intro)]}
 
 async def model(state: State):
-    result = await llm_with_tools.ainvoke(state["messages"])
+    result = await llm.ainvoke(state["messages"])
+    return {"messages": [result]}
+
+async def store_answer(state: State):
+    user_response = state["messages"][-1].content
+    state["answers"].append(user_response)
+    state["question_count"] += 1
+    return {"messages": []}
+
+async def check_continue(state: State):
+    if state["question_count"] < state["max_questions"]:
+        return "model"
+    return "score_session"
+
+async def score_session(state: State):
+    joined = "\n\n".join(state["answers"])
+    prompt = f"Evaluate the following responses for a {state['interview_type']} interview. Give a score out of 10 in score/10 format and feedback in 50 words:\n\n{joined}"
+    result = await llm.ainvoke([HumanMessage(content=prompt)])
+    state["score"] = extract_score(result.content)
+
+    doc = Document(
+        page_content=result.content,
+        metadata={
+            "user_id": state["user_id"],
+            "interview_type": state["interview_type"],
+            "score": state["score"],
+            "session_id": state["session_id"]
+        }
+    )
+    vectorstore.add_documents([doc])
+
+    return {"messages": [result]}
+
+async def check_previous_sessions(state: State):
+    previous_docs = vectorstore.similarity_search(
+        "interview feedback",
+        filter={"user_id": state["user_id"], "interview_type": state["interview_type"]},
+        k=5
+    )
+
+    if previous_docs:
+        combined_content = "\n\n".join([doc.page_content for doc in previous_docs])
+        combined_doc = Document(
+            page_content=combined_content,
+            metadata={"combined": True}
+        )
+        state["previous_session"] = combined_doc
+        return "compare_sessions"
+    return END
+
+async def compare_sessions(state: State):
+    new_feedback = state["messages"][-1].content
+    prev = state.get("previous_session")
+    if not prev:
+        return {"messages": [HumanMessage(content="No previous session to compare.")]}
+
+    prompt = f"""
+Compare these previous interviews:
+{prev.page_content}
+
+With this new interview:
+Score: {state['score']}
+Feedback: {new_feedback}
+
+Provide a detailed comparison and performance report.
+"""
+    result = await llm.ainvoke([HumanMessage(content=prompt)])
     return {"messages": [result]}
 
 
-async def tools_router(state: State):
-    last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and len(last_message.tool_calls) > 0:
-        return "tool_node"
-    else:
-        return END
-
-
-async def tool_node(state: State):
-    tool_calls = state["messages"][-1].tool_calls
-    tool_messages = []
-    for tool_call in tool_calls:
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        tool_id = tool_call["id"]
-
-        if tool_name == "tavily_search_results_json":
-            search_results = await search_tool.ainvoke(tool_args)
-
-            tool_message = ToolMessage(
-                content=str(search_results),
-                tool_call_id=tool_id,
-                name=tool_name
-            )
-            tool_messages.append(tool_message)
-    return {"messages": tool_messages}
-
-async def summarize_search_node(state: State):
-    tool_msg = state["messages"][-1]
-    try:
-        results = ast.literal_eval(tool_msg.content)
-    except Exception:
-        results = []
-
-    summary_prompt = "Summarize the following news updates about Real Madrid:\n\n"
-    for item in results:
-        summary_prompt += f"Title: {item.get('title', '')}\nSnippet: {item.get('content', '')}\n\n"
-
-    summary_llm = ChatOpenAI(model="gpt-4o", streaming=True)
-    response = await summary_llm.ainvoke([HumanMessage(content=summary_prompt)])
-    return {"messages": [response]}
+def extract_score(text: str) -> int:
+    import re
+    match = re.search(r"(\d+(\.\d+)?)/?10", text)
+    if match:
+        return int(float(match.group(1)))
+    return 0
 
 
 graph_builder = StateGraph(State)
 
+graph_builder.add_node("start_interview", start_interview)
 graph_builder.add_node("model", model)
-graph_builder.add_node("tool_node", tool_node)
-graph_builder.add_node("summarize_search", summarize_search_node)
+graph_builder.add_node("store_answer", store_answer)
+graph_builder.add_node("check_continue", check_continue)
+graph_builder.add_node("score_session", score_session)
+graph_builder.add_node("check_previous_sessions", check_previous_sessions)
+graph_builder.add_node("compare_sessions", compare_sessions)
 
-graph_builder.set_entry_point("model")
+graph_builder.set_entry_point("start_interview")
 
-graph_builder.add_conditional_edges("model", tools_router)
-graph_builder.add_edge("tool_node", "summarize_search")
-graph_builder.add_edge("summarize_search", "model")
+graph_builder.add_edge("start_interview", "model")
+graph_builder.add_edge("model", "store_answer")
+graph_builder.add_edge("store_answer", "check_continue")
 
+graph_builder.add_conditional_edges("check_continue", {
+    "model": "model",
+    "score_session": "score_session"
+})
+
+graph_builder.add_edge("score_session", "check_previous_sessions")
+graph_builder.add_conditional_edges("check_previous_sessions", {
+    "compare_sessions": "compare_sessions",
+    END: END
+})
 
 graph = graph_builder.compile(checkpointer=checkpointer)

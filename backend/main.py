@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Query,StreamingResponse
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app import generate_chat_responses
+from routes import start_interview, continue_interview
 
 @app.get("/")
 async def root():
@@ -18,9 +18,5 @@ app.add_middleware(
 )
 
 
-@app.get("/chat_stream/{message}")
-async def chat_stream(message: str, checkpoint_id: Optional[str] = Query(None)):
-    return StreamingResponse(
-        generate_chat_responses(message, checkpoint_id), 
-        media_type="text/event-stream"
-    )
+app.include_router(start_interview.router)
+app.include_router(continue_interview.router)
